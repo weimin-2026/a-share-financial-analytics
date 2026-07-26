@@ -19,7 +19,13 @@ from src.charts import (
 from src.config import STOCKS
 from src.data import fetch_history, fetch_spot, load_stock_pool
 from src.indicators import add_indicators
-from src.paper_trading import account_summary, execute_paper_order, new_account
+from src.paper_trading import (
+    account_summary,
+    execute_paper_order,
+    execute_replay_order,
+    new_account,
+    replay_snapshot,
+)
 from src.trend import analyze_trend
 from src.utils import dataframe_to_csv
 
@@ -435,9 +441,7 @@ def trend_page() -> None:
         )
 
 
-def paper_page() -> None:
-    st.title("模拟交易 Paper Trading")
-    st.markdown('<span class="status-pill">● 模拟账户</span>', unsafe_allow_html=True)
+def _latest_paper_page() -> None:
     st.caption("账户数据保存在当前浏览器会话中，刷新会话后可重新初始化。")
 
     initial = 100_000.0
@@ -675,6 +679,335 @@ def paper_page() -> None:
                 dataframe_to_csv(trades),
                 "paper_trades.csv",
             )
+
+
+def _save_replay_snapshot(state: dict[str, object], row: pd.Series) -> None:
+    """写入当前交易日权益；同一天交易后覆盖旧快照。"""
+    snapshot = replay_snapshot(
+        state["account"],
+        str(state["symbol"]),
+        float(row["close"]),
+        row["date"],
+    )
+    equity_curve: list[dict[str, object]] = state["equity_curve"]
+    if equity_curve and equity_curve[-1]["date"] == snapshot["date"]:
+        equity_curve[-1] = snapshot
+    else:
+        equity_curve.append(snapshot)
+
+
+def _new_replay_state(
+    symbol: str,
+    data: pd.DataFrame,
+    start_date: date,
+    initial_cash: float,
+) -> dict[str, object]:
+    """按所选日期创建一局历史回放。"""
+    candidates = data.index[data["date"].dt.date >= start_date]
+    if candidates.empty:
+        raise ValueError("所选日期之后没有可用交易日。")
+    start_index = int(candidates[0])
+    state: dict[str, object] = {
+        "symbol": symbol,
+        "requested_start_date": start_date,
+        "start_date": pd.Timestamp(data.iloc[start_index]["date"]).date(),
+        "start_index": start_index,
+        "current_index": start_index,
+        "account": new_account(initial_cash),
+        "equity_curve": [],
+    }
+    _save_replay_snapshot(state, data.iloc[start_index])
+    return state
+
+
+def _advance_replay(
+    state: dict[str, object], data: pd.DataFrame, target_index: int
+) -> None:
+    """把回放向前推进并逐日记录账户权益，不允许倒退。"""
+    current_index = int(state["current_index"])
+    target_index = min(max(target_index, current_index), len(data) - 1)
+    for index in range(current_index + 1, target_index + 1):
+        _save_replay_snapshot(state, data.iloc[index])
+    state["current_index"] = target_index
+
+
+def _history_replay_page() -> None:
+    st.markdown("#### 选择历史起点")
+    setup_one, setup_two, setup_three = st.columns([1.2, 1, 1])
+    symbol = setup_one.selectbox(
+        "回放股票",
+        list(STOCKS),
+        format_func=lambda code: f"{code} {STOCKS[code]}",
+        key="replay_symbol",
+    )
+    loaded = load_or_stop(symbol)
+    if loaded is None:
+        return
+    data, source = loaded
+    first_date = pd.Timestamp(data["date"].iloc[0]).date()
+    last_date = pd.Timestamp(data["date"].iloc[-1]).date()
+    default_index = max(0, len(data) - 252)
+    default_date = pd.Timestamp(data["date"].iloc[default_index]).date()
+    start_date = setup_two.date_input(
+        "回放开始日期",
+        value=default_date,
+        min_value=first_date,
+        max_value=last_date,
+        key=f"replay_start_{symbol}",
+    )
+    initial_cash = setup_three.number_input(
+        "回放初始资金",
+        min_value=10_000.0,
+        max_value=10_000_000.0,
+        value=100_000.0,
+        step=10_000.0,
+        key="replay_initial_cash",
+    )
+
+    setup_signature = (symbol, start_date.isoformat(), float(initial_cash))
+    state = st.session_state.get("history_replay")
+    state_signature = None
+    if state is not None:
+        state_signature = (
+            state["symbol"],
+            state["requested_start_date"].isoformat(),
+            float(state["account"]["initial_cash"]),
+        )
+    start_clicked = st.button(
+        "开始 / 重新开始回放",
+        type="primary",
+        key="start_history_replay",
+    )
+    if start_clicked or state is None:
+        state = _new_replay_state(symbol, data, start_date, initial_cash)
+        st.session_state.history_replay = state
+        state_signature = setup_signature
+    if state_signature != setup_signature:
+        st.info("回放设置已改变，请点击“开始 / 重新开始回放”应用新设置。")
+        return
+
+    current_index = int(state["current_index"])
+    start_index = int(state["start_index"])
+    current = data.iloc[current_index]
+    current_date = pd.Timestamp(current["date"])
+    current_price = float(current["close"])
+    account = state["account"]
+    summary = account_summary(account, {symbol: current_price})
+    shares = int(account["positions"].get(symbol, 0))
+    average_cost = float(account["average_costs"].get(symbol, 0.0))
+    fee_rate = 0.0005
+    progress = (current_index - start_index + 1) / (len(data) - start_index)
+
+    st.progress(
+        progress,
+        text=(
+            f"回放日期：{current_date:%Y-%m-%d}　"
+            f"第 {current_index - start_index + 1} / {len(data) - start_index} 个交易日"
+        ),
+    )
+    metrics = st.columns(5)
+    metrics[0].metric("当日收盘价", f"¥{current_price:,.2f}")
+    metrics[1].metric("可用现金", f"¥{summary['cash']:,.2f}")
+    metrics[2].metric("持仓", f"{shares:,} 股")
+    metrics[3].metric("账户总资产", f"¥{summary['total_asset']:,.2f}")
+    metrics[4].metric(
+        "累计盈亏",
+        f"¥{summary['profit_loss']:,.2f}",
+        delta=f"{summary['profit_loss'] / float(account['initial_cash']):+.2%}",
+    )
+
+    chart_col, order_col = st.columns([1.35, 0.65])
+    with chart_col:
+        indicators = add_indicators(data, 20, 60, 14)
+        visible_data = indicators.iloc[: current_index + 1].tail(180)
+        st.plotly_chart(
+            price_indicator_chart(
+                visible_data,
+                f"{symbol} {STOCKS[symbol]} · 截至 {current_date:%Y-%m-%d}",
+            ),
+            width="stretch",
+            key="replay_price_chart",
+        )
+        st.caption("图表只显示当前回放日期及以前的数据，后面的行情尚未揭晓。")
+
+    with order_col:
+        st.markdown("#### 当日模拟下单")
+        max_buy = int(
+            (float(account["cash"]) / (current_price * (1 + fee_rate))) // 100 * 100
+        )
+        order_quantity = st.number_input(
+            "交易数量（100 股的整数倍）",
+            min_value=100,
+            value=100,
+            step=100,
+            key="replay_order_quantity",
+        )
+        detail_one, detail_two = st.columns(2)
+        detail_one.metric("最多可买", f"{max_buy:,} 股")
+        detail_two.metric("持仓成本", f"¥{average_cost:,.2f}")
+        buy_col, sell_col = st.columns(2)
+        buy_clicked = buy_col.button(
+            "买入",
+            type="primary",
+            width="stretch",
+            disabled=int(order_quantity) > max_buy,
+            key="replay_buy",
+        )
+        sell_clicked = sell_col.button(
+            "卖出",
+            width="stretch",
+            disabled=int(order_quantity) > shares,
+            key="replay_sell",
+        )
+        if buy_clicked or sell_clicked:
+            side = "BUY" if buy_clicked else "SELL"
+            try:
+                order = execute_replay_order(
+                    account,
+                    symbol,
+                    STOCKS[symbol],
+                    side,
+                    int(order_quantity),
+                    current_price,
+                    current_date,
+                    fee_rate,
+                )
+                _save_replay_snapshot(state, current)
+                st.toast(
+                    f"{current_date:%Y-%m-%d} 已模拟"
+                    f"{'买入' if side == 'BUY' else '卖出'} "
+                    f"{order['quantity']:,} 股"
+                )
+                st.rerun()
+            except ValueError as error:
+                st.warning(str(error))
+        st.caption(f"成交价使用当日收盘价 · 单边手续费率 {fee_rate:.04%}")
+
+    st.markdown("#### 推进时间")
+    next_col, fast_col, jump_col = st.columns([0.8, 0.9, 1.5])
+    at_end = current_index >= len(data) - 1
+    if next_col.button(
+        "下一个交易日",
+        width="stretch",
+        disabled=at_end,
+        key="replay_next_day",
+    ):
+        _advance_replay(state, data, current_index + 1)
+        st.rerun()
+    fast_days = fast_col.selectbox(
+        "快速推进",
+        [5, 10, 20],
+        format_func=lambda value: f"{value} 个交易日",
+        key="replay_fast_days",
+        disabled=at_end,
+    )
+    if fast_col.button(
+        "执行推进",
+        width="stretch",
+        disabled=at_end,
+        key="replay_fast_forward",
+    ):
+        _advance_replay(state, data, current_index + int(fast_days))
+        st.rerun()
+
+    jump_default_index = min(current_index + 20, len(data) - 1)
+    jump_date = jump_col.date_input(
+        "直接推进到日期",
+        value=pd.Timestamp(data.iloc[jump_default_index]["date"]).date(),
+        min_value=current_date.date(),
+        max_value=last_date,
+        key=f"replay_jump_{current_index}",
+        disabled=at_end,
+    )
+    if jump_col.button(
+        "推进到所选日期",
+        width="stretch",
+        disabled=at_end,
+        key=f"replay_jump_button_{current_index}",
+    ):
+        candidates = data.index[data["date"].dt.date >= jump_date]
+        target_index = int(candidates[0]) if not candidates.empty else len(data) - 1
+        _advance_replay(state, data, target_index)
+        st.rerun()
+    if at_end:
+        st.success("历史行情已经回放到最后一个交易日，可查看最终成绩或重新开始。")
+
+    result_tab, trade_tab = st.tabs(["账户收益曲线", "回放交易记录"])
+    with result_tab:
+        equity = pd.DataFrame(state["equity_curve"])
+        figure = go.Figure()
+        figure.add_scatter(
+            x=equity["date"],
+            y=equity["total_asset"],
+            mode="lines+markers",
+            name="账户总资产",
+        )
+        figure.add_hline(
+            y=float(account["initial_cash"]),
+            line_dash="dash",
+            line_color="#94a3b8",
+            annotation_text="初始资金",
+        )
+        figure.update_layout(
+            xaxis_title="回放日期",
+            yaxis_title="账户资产",
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            height=360,
+        )
+        st.plotly_chart(figure, width="stretch", key="replay_equity_chart")
+    with trade_tab:
+        trades = pd.DataFrame(account["trades"])
+        if trades.empty:
+            st.info("还没有交易。选择股数并在某个回放日期买入或卖出。")
+        else:
+            display_trades = trades.rename(
+                columns={
+                    "date": "日期",
+                    "side": "方向",
+                    "price": "成交价",
+                    "quantity": "数量",
+                    "fee": "手续费",
+                    "cash_after": "交易后现金",
+                    "shares_after": "交易后持仓",
+                    "profit_loss": "本次实现盈亏",
+                }
+            )
+            display_trades["方向"] = display_trades["方向"].map(
+                {"BUY": "买入", "SELL": "卖出"}
+            )
+            st.dataframe(
+                display_trades[
+                    [
+                        "日期",
+                        "方向",
+                        "成交价",
+                        "数量",
+                        "手续费",
+                        "交易后现金",
+                        "交易后持仓",
+                        "本次实现盈亏",
+                    ]
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+            st.download_button(
+                "下载回放交易记录",
+                dataframe_to_csv(trades),
+                "history_replay_trades.csv",
+            )
+    st.caption(f"行情来源：{source}。历史回放只用于学习，不连接真实券商。")
+
+
+def paper_page() -> None:
+    st.title("模拟交易 Paper Trading")
+    st.markdown('<span class="status-pill">● 模拟账户</span>', unsafe_allow_html=True)
+    latest_tab, replay_tab = st.tabs(["最新行情模拟", "历史回放模式"])
+    with latest_tab:
+        _latest_paper_page()
+    with replay_tab:
+        _history_replay_page()
 
 
 def methodology_page() -> None:
