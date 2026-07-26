@@ -80,7 +80,7 @@ MA 是给定窗口内收盘价的简单平均值。RSI 根据上涨和下跌幅�
 
 ## 在线网站
 
-尚未部署；只有公网 URL 实际打开并验证后才会在此填写真实链接。
+https://a-share-financial-analytics-mfvdypzquvsoop9any75rc.streamlit.app/
 
 ## GitHub
 
