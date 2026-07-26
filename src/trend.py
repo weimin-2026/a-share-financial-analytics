@@ -32,6 +32,10 @@ def analyze_trend(
     test_mae = float(mean_absolute_error(y[split:], predictions[split:]))
     future_x = np.arange(len(frame), len(frame) + future_days).reshape(-1, 1)
     future = model.predict(future_x)
+    future_dates = pd.bdate_range(
+        start=pd.Timestamp(frame["date"].iloc[-1]) + pd.offsets.BDay(1),
+        periods=future_days,
+    )
     relative_slope = float(model.coef_[0] / max(abs(y.mean()), 1e-9))
     direction = (
         "向上"
@@ -45,7 +49,13 @@ def analyze_trend(
     result["set"] = np.where(np.arange(len(frame)) < split, "训练集", "测试集")
     return {
         "history": result,
-        "future": pd.DataFrame({"step": range(1, future_days + 1), "trend": future}),
+        "future": pd.DataFrame(
+            {
+                "date": future_dates,
+                "step": range(1, future_days + 1),
+                "trend": future,
+            }
+        ),
         "mae": test_mae,
         "direction": direction,
         "split_index": split,

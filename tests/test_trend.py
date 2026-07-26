@@ -13,6 +13,7 @@ def test_time_split_and_mae(price_data) -> None:
     assert (history.iloc[split:]["set"] == "测试集").all()
     assert result["mae"] >= 0
     assert len(result["future"]) == 10
+    assert result["future"]["date"].min() > history["date"].max()
 
 
 def test_empty_trend_rejected(price_data) -> None:
