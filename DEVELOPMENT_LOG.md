@@ -7,5 +7,5 @@
 - 真实预取十只股票，每只获得 2407–2564 行日线数据。
 - 通过 10 个离线单元测试、Ruff、项目验证和七页应用冒烟测试。
 - 本地 Streamlit 服务返回 HTTP 200。
-- GitHub 发布等待条件：本机未安装 `gh`，已连接 GitHub 应用当前可访问仓库数为 0。
+- 安装并验证 GitHub CLI 后，创建公开仓库并推送 `main`。
 - 对应提交：`feat: build A-share financial learning platform`。

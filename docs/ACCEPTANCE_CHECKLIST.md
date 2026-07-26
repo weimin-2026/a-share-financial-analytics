@@ -8,5 +8,5 @@
 - [x] 只做多、整手、现金和持仓非负
 - [x] CSV 下载与风险声明已实现
 - [x] `pytest`、Ruff、验证脚本全部通过
-- [ ] GitHub 真实推送
+- [x] GitHub 真实推送
 - [ ] Streamlit 公网 URL 真实打开验证
